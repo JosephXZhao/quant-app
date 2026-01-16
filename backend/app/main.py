@@ -15,12 +15,12 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 
 
-app = FastAPI(title="Quant API (SMA + ML + Indicators + Controls)")
+app = FastAPI(title="Quant API (months, SMA + ML + indicators + controls + history)")
 
 # Allow your React frontend (port 5173) to call this API
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # OK for local dev; restrict for production
+    allow_origins=["*"],  # restrict later for prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -34,29 +34,42 @@ class QuoteResponse(BaseModel):
     price: float
     pe: Optional[float] = None
     market_cap: Optional[float] = None
+    volume: Optional[int] = None
 
 
 class BacktestRequest(BaseModel):
     symbol: str
     model_type: str = "sma_crossover"  # "sma_crossover", "logistic", "random_forest"
-    years: int = 3                     # backtest window in years
+    months: int = 36                   # backtest window in months
 
-    # New user controls
-    sma_fast: int = 10                 # fast SMA window
-    sma_slow: int = 50                 # slow SMA window
-    rsi_window: int = 14               # RSI lookback
-    vol_window: int = 20               # realized vol lookback
-    mom_lookback: int = 10             # momentum lookback (days)
-    prob_threshold: float = 0.55       # ML long/flat cutoff
+    # User controls
+    sma_fast: int = 10
+    sma_slow: int = 50
+    rsi_window: int = 14
+    vol_window: int = 20
+    mom_lookback: int = 10
+    prob_threshold: float = 0.55
 
 
 class BacktestResponse(BaseModel):
     symbol: str
     model_type: str
-    years: int
+    months: int
     metrics: dict
     equity_curve: List[List[Union[str, float]]]
     benchmark_curve: List[List[Union[str, float]]]
+
+
+class HistoryPoint(BaseModel):
+    date: str
+    close: float
+    volume: Optional[int] = None
+
+
+class HistoryResponse(BaseModel):
+    symbol: str
+    months: int
+    points: List[HistoryPoint]
 
 
 # ---------- Utility functions ----------
@@ -93,10 +106,10 @@ def _max_drawdown(equity: pd.Series) -> float:
 
 def _sanitize_params(req: BacktestRequest) -> BacktestRequest:
     """
-    Clamp user-provided parameters to reasonable ranges
-    so they can't accidentally blow up the math.
+    Clamp user-provided parameters to reasonable ranges.
     """
-    years = max(1, min(req.years, 10))
+    # 1–120 months (up to ~10 years)
+    months = max(1, min(req.months, 120))
 
     sma_fast = max(2, min(req.sma_fast, 100))
     sma_slow = max(sma_fast + 1, min(req.sma_slow, 300))
@@ -110,7 +123,7 @@ def _sanitize_params(req: BacktestRequest) -> BacktestRequest:
     return BacktestRequest(
         symbol=req.symbol,
         model_type=req.model_type,
-        years=years,
+        months=months,
         sma_fast=sma_fast,
         sma_slow=sma_slow,
         rsi_window=rsi_window,
@@ -122,7 +135,7 @@ def _sanitize_params(req: BacktestRequest) -> BacktestRequest:
 
 def _download_price_df(
     symbol: str,
-    years: int,
+    months: int,
     sma_fast: int,
     sma_slow: int,
     rsi_window: int,
@@ -130,17 +143,17 @@ def _download_price_df(
     mom_lookback: int,
 ) -> pd.DataFrame:
     """
-    Download daily price data from Yahoo and build a feature dataframe with:
+    Download daily price data from Yahoo and build feature dataframe:
       - close
       - ret_1
       - sma_fast, sma_slow
-      - rsi_<rsi_window>
-      - vol_<vol_window> (realized)
-      - mom_<mom_lookback>
+      - rsi
+      - vol
+      - mom
     """
-
     end = date.today()
-    start = end - timedelta(days=365 * years + 30)
+    days = months * 30 + 30
+    start = end - timedelta(days=days)
 
     try:
         data = yf.download(symbol, start=start, end=end, progress=False)
@@ -150,12 +163,12 @@ def _download_price_df(
     if data.empty:
         raise HTTPException(status_code=400, detail="No price data for this symbol / period.")
 
-    # Flatten possible MultiIndex columns
+    # Flatten MultiIndex columns if needed
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = ["_".join([str(c) for c in col if c != ""]).strip()
                         for col in data.columns.values]
 
-    # Choose price column robustly (Adj Close preferred, else Close)
+    # Price column
     price_col = None
     candidates = [
         "Adj Close",
@@ -163,7 +176,6 @@ def _download_price_df(
         "Close",
         f"Close_{symbol}",
     ]
-
     for cand in candidates:
         if cand in data.columns:
             price_col = cand
@@ -177,7 +189,7 @@ def _download_price_df(
 
     df = data[[price_col]].rename(columns={price_col: "close"}).copy()
 
-    # --- Core primitive series ---
+    # Core series
     df["ret_1"] = df["close"].pct_change()
 
     # SMAs
@@ -187,7 +199,7 @@ def _download_price_df(
     # Momentum
     df["mom"] = df["close"] / df["close"].shift(mom_lookback) - 1.0
 
-    # Realized volatility (annualized)
+    # Realized vol
     df["vol"] = df["ret_1"].rolling(vol_window).std() * np.sqrt(252)
 
     # RSI
@@ -202,7 +214,6 @@ def _download_price_df(
     rsi = 100 - (100 / (1 + rs))
     df["rsi"] = rsi
 
-    # Drop early NaNs
     df = df.dropna()
     if len(df) < 200:
         raise HTTPException(status_code=400, detail="Not enough data after feature engineering.")
@@ -212,8 +223,7 @@ def _download_price_df(
 
 def _build_sma_strategy(df: pd.DataFrame):
     """
-    SMA(long/flat) strategy using ret_1 and sma_fast / sma_slow.
-    Returns (strat_ret, bench_ret) as Series aligned on df index.
+    SMA(long/flat) using sma_fast/sma_slow and ret_1.
     """
     out = df.copy()
     out["position"] = np.where(out["sma_fast"] > out["sma_slow"], 1.0, 0.0)
@@ -228,11 +238,10 @@ def _build_sma_strategy(df: pd.DataFrame):
 def _build_ml_strategy(df: pd.DataFrame, model_type: str, prob_threshold: float):
     """
     ML-based long/flat strategy:
-      - Label: future_ret_1 > 0 ? 1 : 0
+      - Label: future_ret_1 > 0
       - Features: [ret_1, sma_fast, sma_slow, rsi, vol, mom]
-      - Train on first 70%, test on last 30%
-      - Position: long if P(up) > prob_threshold, else flat.
-      - Returns: future_ret_1 as payoff.
+      - Train 70%, test 30%
+      - Long if P(up) > prob_threshold
     """
     out = df.copy()
     out["future_ret_1"] = out["close"].shift(-1) / out["close"] - 1.0
@@ -262,7 +271,7 @@ def _build_ml_strategy(df: pd.DataFrame, model_type: str, prob_threshold: float)
     fut_ret_test = fut_ret[split:]
     dates_test = dates[split:]
 
-    # Choose model
+    # Model choice
     if model_type == "random_forest":
         model = RandomForestClassifier(
             n_estimators=200,
@@ -270,16 +279,15 @@ def _build_ml_strategy(df: pd.DataFrame, model_type: str, prob_threshold: float)
             min_samples_leaf=5,
             random_state=42,
         )
-    else:  # "logistic"
+    else:  # logistic
         model = LogisticRegression(max_iter=2000)
 
     model.fit(X_train, y_train)
     proba_up = model.predict_proba(X_test)[:, 1]
 
-    # Position: long if P(up) > prob_threshold
     position = (proba_up > prob_threshold).astype(float)
     strat_ret = position * fut_ret_test
-    bench_ret = fut_ret_test  # buy & hold in same period
+    bench_ret = fut_ret_test
 
     strat_ret_series = pd.Series(strat_ret, index=dates_test)
     bench_ret_series = pd.Series(bench_ret, index=dates_test)
@@ -314,37 +322,144 @@ def _build_equity_and_metrics(strat_ret: pd.Series, bench_ret: pd.Series):
 
 @app.get("/")
 def root():
-    return {"message": "Backend is running with SMA + ML + indicators + controls"}
+    return {"message": "Backend running (window in months)"}
 
 
 @app.get("/api/quote", response_model=QuoteResponse)
 def get_quote(symbol: str):
     """
-    Simple dummy quote endpoint.
-    You can later replace this with a real data source.
+    Real quote from Yahoo Finance:
+      - price: last close
+      - pe: trailing or forward PE
+      - market_cap
+      - volume
     """
+    sym = symbol.upper()
+
+    try:
+        ticker = yf.Ticker(sym)
+        hist = ticker.history(period="5d")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error downloading quote data: {e}")
+
+    if hist.empty:
+        raise HTTPException(status_code=400, detail="No quote data for this symbol.")
+
+    last = hist.iloc[-1]
+    price = float(last["Close"])
+    volume = int(last["Volume"]) if "Volume" in last and not pd.isna(last["Volume"]) else None
+
+    pe = None
+    market_cap = None
+    try:
+        info = ticker.info
+        pe = info.get("trailingPE") or info.get("forwardPE")
+        market_cap = info.get("marketCap")
+    except Exception:
+        pass
+
     return QuoteResponse(
-        symbol=symbol.upper(),
-        price=123.45,
-        pe=20.1,
-        market_cap=1.5e12,
+        symbol=sym,
+        price=price,
+        pe=pe,
+        market_cap=market_cap,
+        volume=volume,
+    )
+
+
+@app.get("/api/history", response_model=HistoryResponse)
+def get_history(symbol: str, months: int = 36):
+    """
+    Price & volume history for the given symbol and window (in months).
+    """
+    sym = symbol.upper()
+    months = max(1, min(months, 120))
+
+    end = date.today()
+    days = months * 30 + 30
+    start = end - timedelta(days=days)
+
+    try:
+        data = yf.download(sym, start=start, end=end, progress=False)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error downloading history: {e}")
+
+    if data.empty:
+        raise HTTPException(status_code=400, detail="No history data for this symbol / period.")
+
+    # Flatten MultiIndex
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = ["_".join([str(c) for c in col if c != ""]).strip()
+                        for col in data.columns.values]
+
+    # Price
+    price_col = None
+    price_candidates = [
+        "Adj Close",
+        f"Adj Close_{sym}",
+        "Close",
+        f"Close_{sym}",
+    ]
+    for cand in price_candidates:
+        if cand in data.columns:
+            price_col = cand
+            break
+
+    if price_col is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No usable price column for history. Columns: {list(data.columns)}",
+        )
+
+    # Volume
+    volume_col = None
+    volume_candidates = [
+        "Volume",
+        f"Volume_{sym}",
+    ]
+    for cand in volume_candidates:
+        if cand in data.columns:
+            volume_col = cand
+            break
+
+    df = data[[price_col]].rename(columns={price_col: "close"}).copy()
+    if volume_col:
+        df["volume"] = data[volume_col]
+    else:
+        df["volume"] = np.nan
+
+    df = df.dropna(subset=["close"])
+
+    points = [
+        HistoryPoint(
+            date=idx.strftime("%Y-%m-%d"),
+            close=float(row["close"]),
+            volume=int(row["volume"]) if not pd.isna(row["volume"]) else None,
+        )
+        for idx, row in df.iterrows()
+    ]
+
+    return HistoryResponse(
+        symbol=sym,
+        months=months,
+        points=points,
     )
 
 
 @app.post("/api/backtest", response_model=BacktestResponse)
 def run_backtest(req: BacktestRequest):
     """
-    Dispatch to different strategies based on model_type, with
-    user-controllable SMA windows & ML probability threshold.
+    Dispatch based on model_type, with tunable SMA windows & ML threshold.
+    Window is in months.
     """
     clean_req = _sanitize_params(req)
 
     symbol = clean_req.symbol.upper()
-    years = clean_req.years
+    months = clean_req.months
 
     df = _download_price_df(
         symbol,
-        years,
+        months,
         clean_req.sma_fast,
         clean_req.sma_slow,
         clean_req.rsi_window,
@@ -370,7 +485,7 @@ def run_backtest(req: BacktestRequest):
     return BacktestResponse(
         symbol=symbol,
         model_type=model_type,
-        years=years,
+        months=months,
         metrics=metrics,
         equity_curve=equity_curve,
         benchmark_curve=benchmark_curve,

@@ -8,6 +8,8 @@ import {
   Tooltip,
   ResponsiveContainer,
   Legend,
+  BarChart,
+  Bar,
 } from "recharts";
 
 const API_URL = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
@@ -18,18 +20,60 @@ const MODEL_OPTIONS = [
   { id: "random_forest", label: "Random Forest" },
 ];
 
+// View window options for price/volume charts
+const VIEW_WINDOWS = [
+  { key: "7d", label: "7 days" },
+  { key: "1m", label: "1 month" },
+  { key: "3m", label: "3 months" },
+  { key: "6m", label: "6 months" },
+  { key: "12m", label: "12 months" },
+  { key: "24m", label: "24 months" },
+  { key: "36m", label: "36 months" },
+  { key: "60m", label: "60 months" },
+];
+
+// Map view window key -> months for backend /api/history
+function windowKeyToMonths(key) {
+  switch (key) {
+    case "7d":
+      return 1; // fetch 1 month, then slice to last 7 points
+    case "1m":
+      return 1;
+    case "3m":
+      return 3;
+    case "6m":
+      return 6;
+    case "12m":
+      return 12;
+    case "24m":
+      return 24;
+    case "36m":
+      return 36;
+    case "60m":
+      return 60;
+    default:
+      return 12;
+  }
+}
+
 function App() {
   const [ticker, setTicker] = useState("");
   const [quote, setQuote] = useState(null);
   const [status, setStatus] = useState("");
   const [loadingQuote, setLoadingQuote] = useState(false);
 
-  const [years, setYears] = useState(3);
+  // Price/volume view window (separate from backtest)
+  const [viewWindow, setViewWindow] = useState("12m");
+  const [priceHistory, setPriceHistory] = useState(null);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+
+  // Backtest window (months, independent from view window)
+  const [backtestMonths, setBacktestMonths] = useState(36);
   const [selectedModels, setSelectedModels] = useState(["sma_crossover"]);
   const [loadingBacktest, setLoadingBacktest] = useState(false);
   const [backtests, setBacktests] = useState([]);
 
-  // New controls
+  // Strategy controls
   const [smaFast, setSmaFast] = useState(10);
   const [smaSlow, setSmaSlow] = useState(50);
   const [probThreshold, setProbThreshold] = useState(0.55);
@@ -53,11 +97,51 @@ function App() {
       if (!res.ok) throw new Error("Quote API error");
       const data = await res.json();
       setQuote(data);
+      // After loading quote, also load history for the current view window
+      await handleLoadHistory(symbol, viewWindow);
     } catch (err) {
       console.error(err);
       setStatus("Error loading quote.");
     } finally {
       setLoadingQuote(false);
+    }
+  }
+
+  async function handleLoadHistory(symbolOverride, windowKeyOverride) {
+    const symbol = (symbolOverride || ticker).trim().toUpperCase();
+    const windowKey = windowKeyOverride || viewWindow;
+
+    if (!symbol) return;
+
+    setLoadingHistory(true);
+    setStatus("");
+
+    try {
+      const months = windowKeyToMonths(windowKey);
+      const res = await fetch(
+        `${API_URL}/api/history?symbol=${encodeURIComponent(
+          symbol
+        )}&months=${months}`
+      );
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.detail || "History API error");
+      }
+      const history = await res.json();
+      setPriceHistory(history);
+    } catch (err) {
+      console.error(err);
+      setStatus(err.message || "Error loading price/volume history.");
+    } finally {
+      setLoadingHistory(false);
+    }
+  }
+
+  function handleChangeViewWindow(newKey) {
+    setViewWindow(newKey);
+    // If a ticker is already loaded, reload history for the new window
+    if (ticker.trim()) {
+      handleLoadHistory(undefined, newKey);
     }
   }
 
@@ -96,10 +180,9 @@ function App() {
           body: JSON.stringify({
             symbol,
             model_type: modelId,
-            years,
+            months: backtestMonths,
             sma_fast: smaFast,
             sma_slow: smaSlow,
-            // keep indicator windows as defaults for now
             rsi_window: 14,
             vol_window: 20,
             mom_lookback: 10,
@@ -120,10 +203,23 @@ function App() {
       setBacktests(results);
     } catch (err) {
       console.error(err);
-      setStatus(err.message || "Error running backtest.");
+      setStatus(err.message || "Error running backtests.");
     } finally {
       setLoadingBacktest(false);
     }
+  }
+
+  // Build price/volume chart data, with special handling for 7d
+  let priceVolumeData =
+    priceHistory?.points?.map((p) => ({
+      date: p.date,
+      close: Number(p.close),
+      volume: p.volume != null ? Number(p.volume) : null,
+    })) || [];
+
+  if (viewWindow === "7d" && priceVolumeData.length > 7) {
+    // Approx: last 7 trading days
+    priceVolumeData = priceVolumeData.slice(-7);
   }
 
   return (
@@ -131,8 +227,8 @@ function App() {
       <div className="card">
         <h1 className="title">Quant Snapshot</h1>
         <p className="subtitle">
-          Enter a stock/ETF ticker. Load a quote, then run backtests with one or
-          more models over a chosen window.
+          Enter a stock/ETF ticker. First explore price & volume, then run
+          model-based backtests on a separate window.
         </p>
 
         {/* Ticker / quote section */}
@@ -173,6 +269,7 @@ function App() {
 
         {status && <div className="status">{status}</div>}
 
+        {/* Quote */}
         {quote && (
           <div className="section">
             <div className="quote-card">
@@ -182,7 +279,7 @@ function App() {
               </div>
               <div className="stat-row">
                 <span>P/E</span>
-                <span>{quote.pe?.toFixed(2) ?? "—"}</span>
+                <span>{quote.pe ? quote.pe.toFixed(2) : "—"}</span>
               </div>
               <div className="stat-row">
                 <span>Market Cap</span>
@@ -192,25 +289,141 @@ function App() {
                     : "—"}
                 </span>
               </div>
+              <div className="stat-row">
+                <span>Volume</span>
+                <span>
+                  {quote.volume
+                    ? quote.volume.toLocaleString()
+                    : "—"}
+                </span>
+              </div>
             </div>
           </div>
         )}
 
-        {/* Backtest controls */}
+        {/* Price & Volume view (separate from backtest) */}
+        {quote && (
+          <div className="section">
+            <h2 className="section-title">Price & Volume View</h2>
+
+            <div className="control-row">
+              <div className="control">
+                <div className="label">View Window</div>
+                <div className="model-pill-row">
+                  {VIEW_WINDOWS.map((opt) => (
+                    <button
+                      key={opt.key}
+                      type="button"
+                      className={
+                        "chip" +
+                        (viewWindow === opt.key ? " chip-active" : "")
+                      }
+                      onClick={() => handleChangeViewWindow(opt.key)}
+                    >
+                      {opt.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
+            {loadingHistory && (
+              <div className="status">Loading price & volume...</div>
+            )}
+
+            {priceVolumeData.length > 0 && !loadingHistory && (
+              <div className="result-card">
+                {/* Price chart */}
+                <div className="chart-container">
+                  <ResponsiveContainer width="100%" height={180}>
+                    <LineChart
+                      data={priceVolumeData}
+                      margin={{ top: 5, right: 10, left: 0, bottom: 5 }}
+                    >
+                      <XAxis dataKey="date" hide />
+                      <YAxis tick={{ fontSize: 10 }} />
+                      <Tooltip
+                        formatter={(value, name) =>
+                          typeof value === "number"
+                            ? name === "Price"
+                              ? value.toFixed(2)
+                              : value.toFixed(3)
+                            : value
+                        }
+                        labelFormatter={(label) => `Date: ${label}`}
+                      />
+                      <Legend
+                        wrapperStyle={{ fontSize: "0.7rem", paddingTop: 4 }}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="close"
+                        stroke="#f97316"
+                        dot={false}
+                        strokeWidth={2}
+                        name="Price"
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+
+                {/* Volume chart (white bars, axis in millions) */}
+                <div className="chart-container">
+                  <ResponsiveContainer width="100%" height={90}>
+                    <BarChart
+                      data={priceVolumeData}
+                      margin={{ top: 5, right: 10, left: 0, bottom: 5 }}
+                    >
+                      <XAxis dataKey="date" hide />
+                      <YAxis
+                        tick={{ fontSize: 10 }}
+                        tickFormatter={(value) =>
+                          typeof value === "number"
+                            ? (value / 1_000_000).toFixed(1) + "M"
+                            : value
+                        }
+                      />
+                      <Tooltip
+                        formatter={(value) =>
+                          typeof value === "number"
+                            ? (value / 1_000_000).toFixed(2) + "M"
+                            : value
+                        }
+                        labelFormatter={(label) => `Date: ${label}`}
+                      />
+                      <Legend
+                        wrapperStyle={{ fontSize: "0.7rem", paddingTop: 4 }}
+                      />
+                      <Bar
+                        dataKey="volume"
+                        name="Volume"
+                        fill="#ffffff"
+                      />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* Backtest controls (separate section) */}
         <div className="section">
-          <h2 className="section-title">Backtest Settings</h2>
+          <h2 className="section-title">Modeling & Backtest</h2>
 
           <div className="control-row">
             <div className="control">
-              <div className="label">Window</div>
+              <div className="label">Backtest Window (months)</div>
               <select
                 className="select"
-                value={years}
-                onChange={(e) => setYears(Number(e.target.value))}
+                value={backtestMonths}
+                onChange={(e) => setBacktestMonths(Number(e.target.value))}
               >
-                <option value={1}>1 Year</option>
-                <option value={3}>3 Years</option>
-                <option value={5}>5 Years</option>
+                <option value={6}>6 months</option>
+                <option value={12}>12 months</option>
+                <option value={24}>24 months</option>
+                <option value={36}>36 months</option>
+                <option value={60}>60 months</option>
               </select>
             </div>
           </div>
@@ -231,7 +444,6 @@ function App() {
             </div>
           </div>
 
-          {/* New param controls */}
           <div className="param-block">
             <div className="label">Strategy Parameters</div>
             <div className="param-row">
@@ -293,7 +505,7 @@ function App() {
         {/* Backtest results */}
         {backtests.length > 0 && (
           <div className="section">
-            <h2 className="section-title">Results</h2>
+            <h2 className="section-title">Backtest Results</h2>
 
             {backtests.map((bt) => {
               const chartData = bt.equity_curve.map((row, idx) => {
@@ -311,7 +523,7 @@ function App() {
                 <div key={bt.model_type} className="result-card">
                   <div className="pill-row">
                     <span className="pill">
-                      {bt.symbol} · {bt.years}y
+                      {bt.symbol} · {bt.months}m
                     </span>
                     <span className="pill">
                       {bt.model_type.replace("_", " ")}
